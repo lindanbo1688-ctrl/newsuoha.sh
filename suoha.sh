@@ -1,5 +1,5 @@
 #!/bin/bash
-# onekey suoha - Full Protocol Edition (1080P/4K TCP+UDP内核优化 + 官方Sing-box主力 + 单Argo双路径 + Reality[Vision/gRPC] + AnyTLS + HY2 + TUIC + Snell双栈 + SS-IPv6)
+# onekey suoha - Argo Only Edition (默认+优选 VLESS/Trojan，短命名，IP地区前缀，systemd开机自启)
 
 export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 
@@ -513,7 +513,7 @@ function show_main_menu() {
 function quicktunnel_all_in_one() {
     clear
     echo -e "${CYAN}==================================================================${NC}"
-    echo -e "${GREEN}   一键全协议梭哈部署启动中 (4K内核调优 + Sing-box + 单Argo + Snell + SS)${NC}"
+    echo -e "${GREEN}   一键部署启动中 (仅 Argo 默认 + 优选：VLESS/Trojan)${NC}"
     echo -e "${CYAN}==================================================================${NC}\n"
 
     show_progress 1 "初始化运行环境并彻底清空旧进程与历史文件..."
@@ -573,15 +573,8 @@ function quicktunnel_all_in_one() {
     show_progress 34 "正在下载 Cloudflare Argo 隧道组件..."
     curl -sL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${arch_cf}" -o /opt/suoha_quick/cloudflared-linux
 
-    show_progress 44 "正在下载官方 Snell v4.1.1 双栈服务端..."
-    curl -sL "https://dl.nssurge.com/snell/snell-server-v4.1.1-${arch_snell}.zip" -o snell.zip
-    if [ -s snell.zip ] && unzip -t snell.zip >/dev/null 2>&1; then
-        unzip -oq snell.zip -d /opt/suoha_quick/ >/dev/null 2>&1
-    fi
-    rm -f snell.zip
-
+    show_progress 44 "跳过 Snell 下载（仅保留默认/优选 Argo 节点）..."
     chmod +x /opt/suoha_quick/sing-box /opt/suoha_quick/cloudflared-linux 2>/dev/null
-    [ -f /opt/suoha_quick/snell-server ] && chmod +x /opt/suoha_quick/snell-server
 
     if [ ! -x /opt/suoha_quick/sing-box ] || [ ! -x /opt/suoha_quick/cloudflared-linux ]; then
         echo -e "\n${RED}核心文件下载失败，请检查服务器网络连接（GitHub 访问是否正常）！${NC}"
@@ -595,59 +588,24 @@ function quicktunnel_all_in_one() {
     local server_ipv6
     server_ipv6=$(get_server_ipv6)
 
-    # 3. 生成自签名 www.bing.com 证书与 Reality 密钥
-    show_progress 52 "正在自签 www.bing.com TLS 证书与 Reality X25519 密钥..."
-    openssl ecparam -genkey -name prime256v1 -out /opt/suoha_quick/cert/bing.key >/dev/null 2>&1
-    openssl req -new -x509 -days 3650 -key /opt/suoha_quick/cert/bing.key \
-        -out /opt/suoha_quick/cert/bing.crt \
-        -subj "/C=US/ST=Washington/L=Redmond/O=Microsoft Corporation/CN=www.bing.com" \
-        -addext "subjectAltName=DNS:www.bing.com,DNS:bing.com" >/dev/null 2>&1
+    # 3. 仅部署 Argo「默认 + 优选」节点（不再生成 Reality/HY2/TUIC/AnyTLS/Snell/SS）
+    show_progress 52 "仅启用 Argo 默认/优选节点，跳过直连协议..."
 
-    local reality_keys
-    reality_keys=$(/opt/suoha_quick/sing-box generate reality-keypair)
-    local reality_priv
-    reality_priv=$(echo "$reality_keys" | awk '/PrivateKey:/ {print $2}')
-    local reality_pub
-    reality_pub=$(echo "$reality_keys" | awk '/PublicKey:/ {print $2}')
-    local reality_sid
-    reality_sid=$(openssl rand -hex 8)
-
-    # 4. 分配随机端口与凭证
+    # 4. 分配凭证与本机 Argo 分流端口（不对公网随机开高位端口）
     local uuid
     uuid=$(cat /proc/sys/kernel/random/uuid)
     local short_id
     short_id=$(echo "$uuid" | awk -F- '{print $1}')
     local urlpath_vless="vl-${short_id}"
     local urlpath_trojan="tr-${short_id}"
-    local grpc_service="gr-${short_id}"
-    local password_all
-    password_all=$(openssl rand -hex 12)
-    local ss_method="aes-128-gcm"
-    local ss_password
-    ss_password=$(openssl rand -hex 12)
 
     local port_argo_entry=$((RANDOM%10000+11000))
     local port_argo_vl=$((port_argo_entry+1))
     local port_argo_tr=$((port_argo_entry+2))
     echo "${port_argo_entry}" > /opt/suoha_quick/argo_entry_port
-    local port_reality=$((RANDOM%10000+21000))
-    local port_anytls=$((port_reality+1))
-    local port_hy2=$((port_reality+2))
-    local port_tuic=$((port_reality+3))
-    local port_snell=$((port_reality+4))
-    local port_ss_v6=$((port_reality+5))
-    local port_rel_grpc=$((port_reality+6))
 
-    open_firewall_port "$port_reality"
-    open_firewall_port "$port_rel_grpc"
-    open_firewall_port "$port_anytls"
-    open_firewall_port "$port_hy2"
-    open_firewall_port "$port_tuic"
-    open_firewall_port "$port_snell"
-    open_firewall_port "$port_ss_v6"
-
-    # 5. 生成官方 Sing-box 主力全协议配置文件 (已暂时屏蔽/移除 XHTTP 节点)
-    show_progress 58 "正在写入官方 Sing-box 主力全协议配置..."
+    # 5. 生成 Sing-box 配置（仅本机 VLESS-WS + Trojan-WS，供 Argo 反代）
+    show_progress 58 "正在写入 Sing-box（仅 Argo 双路径）..."
     cat > /opt/suoha_quick/singbox.json <<EOF
 {
   "log": {
@@ -684,140 +642,6 @@ function quicktunnel_all_in_one() {
         "type": "ws",
         "path": "/${urlpath_trojan}"
       }
-    },
-    {
-      "type": "vless",
-      "tag": "vless-reality-in",
-      "listen": "::",
-      "listen_port": ${port_reality},
-      "users": [
-        {
-          "uuid": "${uuid}",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "www.bing.com",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "www.bing.com",
-            "server_port": 443
-          },
-          "private_key": "${reality_priv}",
-          "short_id": [
-            "${reality_sid}"
-          ]
-        }
-      }
-    },
-    {
-      "type": "vless",
-      "tag": "vless-reality-grpc-in",
-      "listen": "::",
-      "listen_port": ${port_rel_grpc},
-      "users": [
-        {
-          "uuid": "${uuid}"
-        }
-      ],
-      "transport": {
-        "type": "grpc",
-        "service_name": "${grpc_service}"
-      },
-      "tls": {
-        "enabled": true,
-        "server_name": "www.bing.com",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "www.bing.com",
-            "server_port": 443
-          },
-          "private_key": "${reality_priv}",
-          "short_id": [
-            "${reality_sid}"
-          ]
-        }
-      }
-    },
-    {
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "::",
-      "listen_port": ${port_anytls},
-      "users": [
-        {
-          "password": "${password_all}"
-        }
-      ],
-      "padding_scheme": [
-        "stop=8",
-        "0=30-30",
-        "1=100-400",
-        "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
-        "3=9-9,500-1000",
-        "4=500-1000",
-        "5=500-1000",
-        "6=500-1000",
-        "7=500-1000"
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "www.bing.com",
-        "certificate_path": "/opt/suoha_quick/cert/bing.crt",
-        "key_path": "/opt/suoha_quick/cert/bing.key"
-      }
-    },
-    {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "::",
-      "listen_port": ${port_hy2},
-      "users": [
-        {
-          "password": "${password_all}"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "alpn": [
-          "h3"
-        ],
-        "certificate_path": "/opt/suoha_quick/cert/bing.crt",
-        "key_path": "/opt/suoha_quick/cert/bing.key"
-      }
-    },
-    {
-      "type": "tuic",
-      "tag": "tuic-in",
-      "listen": "::",
-      "listen_port": ${port_tuic},
-      "users": [
-        {
-          "uuid": "${uuid}",
-          "password": "${password_all}"
-        }
-      ],
-      "congestion_control": "bbr",
-      "zero_rtt_handshake": false,
-      "tls": {
-        "enabled": true,
-        "alpn": [
-          "h3"
-        ],
-        "certificate_path": "/opt/suoha_quick/cert/bing.crt",
-        "key_path": "/opt/suoha_quick/cert/bing.key"
-      }
-    },
-    {
-      "type": "shadowsocks",
-      "tag": "ss-ipv6-in",
-      "listen": "::",
-      "listen_port": ${port_ss_v6},
-      "method": "${ss_method}",
-      "password": "${ss_password}"
     }
   ],
   "outbounds": [
@@ -829,7 +653,7 @@ function quicktunnel_all_in_one() {
 }
 EOF
 
-    show_progress 66 "正在启动官方 Sing-box 主力、本地分流器与 Snell 双栈守护进程..."
+    show_progress 66 "正在启动 Sing-box 与 Argo 本地分流..."
     nohup /opt/suoha_quick/sing-box run -c /opt/suoha_quick/singbox.json >/opt/suoha_quick/singbox.log 2>&1 &
     local sb_pid=$!
     echo $sb_pid > /opt/suoha_quick/singbox.pid
@@ -885,38 +709,9 @@ EOF
     nohup python3 /opt/suoha_quick/argo_router.py >/dev/null 2>&1 &
     echo $! > /opt/suoha_quick/argo_router.pid
 
-    # 启动 Snell 双栈监听 (使用 ::0:端口 语法确保 IPv4 + IPv6 同步监听)
-    local snell_psk
-    snell_psk=$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 24)
     local snell_installed=0
-    local snell_status="未安装"
-
-    if [ -x /opt/suoha_quick/snell-server ]; then
-        cat > /opt/suoha_quick/snell.conf <<EOF
-[snell-server]
-listen = ::0:${port_snell}
-psk = ${snell_psk}
-ipv6 = true
-obfs = off
-EOF
-        nohup /opt/suoha_quick/snell-server -c /opt/suoha_quick/snell.conf >/opt/suoha_quick/snell.log 2>&1 &
-        local snell_pid=$!
-        echo $snell_pid > /opt/suoha_quick/snell.pid
-        sleep 0.5
-        if ! kill -0 "$snell_pid" 2>/dev/null; then
-            sed -i "s|::0|0.0.0.0|g" /opt/suoha_quick/snell.conf
-            nohup /opt/suoha_quick/snell-server -c /opt/suoha_quick/snell.conf >/opt/suoha_quick/snell.log 2>&1 &
-            snell_pid=$!
-            echo $snell_pid > /opt/suoha_quick/snell.pid
-            sleep 0.5
-        fi
-        if kill -0 "$snell_pid" 2>/dev/null; then
-            snell_installed=1
-            local listen_info
-            listen_info=$(ss -tlpn 2>/dev/null | grep "pid=${snell_pid}" | awk '{print $4}' | tr '\n' ' ')
-            snell_status="运行正常 (PID:${snell_pid} | 监听:${listen_info:-::0:${port_snell}})"
-        fi
-    fi
+    local snell_status="已跳过（仅默认/优选）"
+    local snell_psk=""
 
     local sb_status="运行正常 (PID:${sb_pid})"
     if ! kill -0 "$sb_pid" 2>/dev/null; then
@@ -1043,178 +838,8 @@ EOF
 EOF
     done
 
-    # 确定直连连接地址
-    local direct_host=""
-    local direct_yaml_host=""
-    if [ -n "$server_ip" ]; then
-        direct_host="$server_ip"
-        direct_yaml_host="$server_ip"
-    elif [ -n "$server_ipv6" ]; then
-        direct_host="[${server_ipv6}]"
-        direct_yaml_host="$server_ipv6"
-    fi
-
-    if [ -n "$direct_host" ]; then
-        # (C1) VLESS Reality Vision 直连节点 (主力首选 - 严格保持 4 空格缩进)
-        local pname_rel="${node_tag}-Reality"
-        echo "vless://${uuid}@${direct_host}:${port_reality}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.bing.com&fp=chrome&pbk=${reality_pub}&sid=${reality_sid}&type=tcp&headerType=none#${pname_rel}" >> /opt/suoha_quick/nodes.txt
-        proxy_names+=("$pname_rel")
-        cat >> /opt/suoha_quick/clash.yaml <<EOF
-  - name: "${pname_rel}"
-    type: vless
-    server: ${direct_yaml_host}
-    port: ${port_reality}
-    uuid: ${uuid}
-    network: tcp
-    tls: true
-    udp: true
-    flow: xtls-rprx-vision
-    servername: www.bing.com
-    reality-opts:
-      public-key: ${reality_pub}
-      short-id: "${reality_sid}"
-    client-fingerprint: chrome
-EOF
-
-        # (C2) VLESS Reality gRPC 直连节点 (严格保持 4 空格缩进)
-        local pname_rel_grpc="${node_tag}-Reality-gRPC"
-        echo "vless://${uuid}@${direct_host}:${port_rel_grpc}?encryption=none&security=reality&sni=www.bing.com&fp=chrome&pbk=${reality_pub}&sid=${reality_sid}&type=grpc&serviceName=${grpc_service}&mode=gun#${pname_rel_grpc}" >> /opt/suoha_quick/nodes.txt
-        proxy_names+=("$pname_rel_grpc")
-        cat >> /opt/suoha_quick/clash.yaml <<EOF
-  - name: "${pname_rel_grpc}"
-    type: vless
-    server: ${direct_yaml_host}
-    port: ${port_rel_grpc}
-    uuid: ${uuid}
-    network: grpc
-    tls: true
-    udp: true
-    servername: www.bing.com
-    grpc-opts:
-      grpc-service-name: ${grpc_service}
-    reality-opts:
-      public-key: ${reality_pub}
-      short-id: "${reality_sid}"
-    client-fingerprint: chrome
-EOF
-
-        # (D) AnyTLS 直连节点 (自签 www.bing.com)
-        local pname_any="${node_tag}-AnyTLS"
-        echo "anytls://${password_all}@${direct_host}:${port_anytls}?sni=www.bing.com&insecure=1#${pname_any}" >> /opt/suoha_quick/nodes.txt
-        proxy_names+=("$pname_any")
-        cat >> /opt/suoha_quick/clash.yaml <<EOF
-  - name: "${pname_any}"
-    type: anytls
-    server: ${direct_yaml_host}
-    port: ${port_anytls}
-    password: "${password_all}"
-    client-fingerprint: chrome
-    udp: true
-    sni: www.bing.com
-    skip-cert-verify: true
-EOF
-
-        # (E) Hysteria2 直连节点 (自签 www.bing.com)
-        local pname_hy2="${node_tag}-HY2"
-        echo "hysteria2://${password_all}@${direct_host}:${port_hy2}?sni=www.bing.com&insecure=1#${pname_hy2}" >> /opt/suoha_quick/nodes.txt
-        proxy_names+=("$pname_hy2")
-        cat >> /opt/suoha_quick/clash.yaml <<EOF
-  - name: "${pname_hy2}"
-    type: hysteria2
-    server: ${direct_yaml_host}
-    port: ${port_hy2}
-    password: "${password_all}"
-    sni: www.bing.com
-    skip-cert-verify: true
-    alpn:
-      - h3
-EOF
-
-        # (F) TUIC v5 直连节点 (自签 www.bing.com)
-        local pname_tuic="${node_tag}-TUIC"
-        echo "tuic://${uuid}:${password_all}@${direct_host}:${port_tuic}?congestion_control=bbr&alpn=h3&sni=www.bing.com&udp_relay_mode=native&allow_insecure=1#${pname_tuic}" >> /opt/suoha_quick/nodes.txt
-        proxy_names+=("$pname_tuic")
-        cat >> /opt/suoha_quick/clash.yaml <<EOF
-  - name: "${pname_tuic}"
-    type: tuic
-    server: ${direct_yaml_host}
-    port: ${port_tuic}
-    uuid: ${uuid}
-    password: "${password_all}"
-    alpn:
-      - h3
-    disable-sni: false
-    reduce-rtt: true
-    udp-relay-mode: native
-    congestion-controller: bbr
-    sni: www.bing.com
-    skip-cert-verify: true
-EOF
-    fi
-
-    # (G) 原生 Shadowsocks IPv6 直连节点 (ss-ipv6)
-    local ss_v6_uri=""
-    if [ -n "$server_ipv6" ]; then
-        local ss_user_info="${ss_method}:${ss_password}"
-        local ss_base64=""
-        if [ "$OS_NAME" == "Alpine" ]; then
-            ss_base64=$(echo -n "$ss_user_info" | base64 | tr -d '\n')
-        else
-            ss_base64=$(echo -n "$ss_user_info" | base64 -w 0)
-        fi
-        local pname_ss6="${node_tag}-SS-v6"
-        ss_v6_uri="ss://${ss_base64}@[${server_ipv6}]:${port_ss_v6}#${pname_ss6}"
-        echo "$ss_v6_uri" >> /opt/suoha_quick/nodes.txt
-        proxy_names+=("$pname_ss6")
-        cat >> /opt/suoha_quick/clash.yaml <<EOF
-  - name: "${pname_ss6}"
-    type: ss
-    server: "${server_ipv6}"
-    port: ${port_ss_v6}
-    cipher: ${ss_method}
-    password: "${ss_password}"
-    udp: true
-EOF
-    fi
-
-    # (H) Snell 双栈节点
     local snell_display_lines=""
-    if [ $snell_installed -eq 1 ]; then
-        if [ -n "$server_ip" ]; then
-            local pname_snell_v4="${node_tag}-Snell"
-            proxy_names+=("$pname_snell_v4")
-            cat >> /opt/suoha_quick/clash.yaml <<EOF
-  - name: "${pname_snell_v4}"
-    type: snell
-    server: ${server_ip}
-    port: ${port_snell}
-    psk: "${snell_psk}"
-    version: 4
-    udp: true
-EOF
-            local surge_v4="${pname_snell_v4} = snell, ${server_ip}, ${port_snell}, psk=${snell_psk}, version=4, reuse=true"
-            echo "$surge_v4" >> /opt/suoha_quick/surge.conf
-            snell_display_lines+="${surge_v4}\n"
-        fi
-
-        if [ -n "$server_ipv6" ]; then
-            local pname_snell_v6="${node_tag}-Snell-v6"
-            proxy_names+=("$pname_snell_v6")
-            cat >> /opt/suoha_quick/clash.yaml <<EOF
-  - name: "${pname_snell_v6}"
-    type: snell
-    ip-version: ipv6
-    server: "${server_ipv6}"
-    port: ${port_snell}
-    psk: "${snell_psk}"
-    version: 4
-    udp: true
-EOF
-            local surge_v6="${pname_snell_v6} = snell, ${server_ipv6}, ${port_snell}, psk=${snell_psk}, version=4, reuse=true"
-            echo "$surge_v6" >> /opt/suoha_quick/surge.conf
-            snell_display_lines+="${surge_v6}\n"
-        fi
-    fi
+    local ss_v6_uri=""
 
     cat >> /opt/suoha_quick/clash.yaml <<EOF
 proxy-groups:
@@ -1262,32 +887,23 @@ EOF
     qdisc_active=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "default")
 
     cat > /opt/suoha_quick/v2ray.txt <<EOF
-======================== 一键全协议梭哈节点列表 ========================
+======================== Argo 默认/优选节点列表 ========================
 [核心运行状态]:
-  ├─ 1080P/4K 内核网络调优 : 拥塞控制=${cc_active} | 队列=${qdisc_active} | 缓冲上限=$((max_buf/1048576))MB
-  ├─ 官方 Sing-box 主力进程 : ${sb_status}
-  └─ Snell 双栈守护进程    : ${snell_status}
+  ├─ 内核网络调优 : 拥塞控制=${cc_active} | 队列=${qdisc_active}
+  └─ Sing-box 进程 : ${sb_status}
 
+[模式]: 仅保留默认 + 优选（VLESS/Trojan × 3 = 共 6 个节点）
 [单 Argo 共用域名]: ${argo_domain}
   ├─ VLESS  WebSocket 路径: /${urlpath_vless}
   └─ Trojan WebSocket 路径: /${urlpath_trojan}
 
-[URI 通用节点链接 (Argo / Reality[Vision/gRPC] / AnyTLS / HY2 / TUIC / SS-IPv6)]
+[节点链接]
 $(cat /opt/suoha_quick/nodes.txt)
 
-[Snell 双栈专属配置 (Surge / Clash Verge / Mihomo)]
-$(echo -e "${snell_display_lines:-未检测到可用公网 IP，跳过 Snell 生成}")
-======================== 端口与证书说明 ========================
-- Argo 节点 443 端口可按需替换为 CF 其它 TLS 端口: 2053, 2083, 2087, 2096, 8443
-
-- AnyTLS / Hysteria2 / TUIC 均已自动签发 www.bing.com 证书 (客户端需开启跳过证书验证)
-
-- VLESS Reality 共用参数 -> 伪装域名: www.bing.com | PublicKey: ${reality_pub} | ShortID: ${reality_sid}
-
-  ├─ Reality Vision 端口: ${port_reality}
-  └─ Reality gRPC   端口: ${port_rel_grpc} (ServiceName: ${grpc_service})
-- (注: XHTTP 节点已暂时屏蔽，等待官方内核原生支持)
-
+======================== 说明 ========================
+- 已移除 Reality / AnyTLS / HY2 / TUIC / Snell / SS 直连节点
+- 客户端看到的端口均为 443（走 Cloudflare），不再占用本机高位公网端口
+- Argo 节点 443 也可按需换 CF 其它 TLS 端口: 2053, 2083, 2087, 2096, 8443
 
 ======================== 客户端订阅及导入链接 ========================
 本机固定订阅服务端口: ${sub_port} (已永久保存，重新梭哈无需重新导入客户端)
@@ -1309,7 +925,7 @@ ${clash_online_url}
 手动恢复: 菜单选 2  或  bash $0 start
 快捷卸载: 菜单选 3  或  bash $0 uninstall
 
-注意: Argo 临时域名重启后可能变化，开机脚本会自动改写订阅；直连节点 UUID 不变。
+注意: Argo 临时域名重启后可能变化，开机脚本会自动改写订阅。
 客户端若用在线订阅，重启后点「更新订阅」即可。
 =====================================================================
 EOF
