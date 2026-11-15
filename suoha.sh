@@ -4,12 +4,111 @@
 export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 
 ACTION="${1:-}"
+FORCE_NEW_UUID="${FORCE_NEW_UUID:-0}"
+KEEP_UUID="${KEEP_UUID:-}"
+for _arg in "$@"; do
+    case "$_arg" in
+        --force|--new-uuid) FORCE_NEW_UUID=1 ;;
+        --keep|--keep-uuid) KEEP_UUID=1 ;;
+    esac
+done
 
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
+
+SUOHA_DIR=/opt/suoha_quick
+SUOHA_STATE=/var/lib/suoha
+SUOHA_CRED="${SUOHA_STATE}/credentials.env"
+SUOHA_DEBUG_LOG="${SUOHA_STATE}/debug-boot.ndjson"
+
+# #region agent log
+function suoha_debug_log() {
+    # hypothesisId: A=reinstall_wipes B=systemd_missing C=argo_domain_only D=boot_rewrites_uuid
+    local hid="${1:-X}"
+    local msg="${2:-}"
+    local data="${3:-{}}"
+    mkdir -p "$SUOHA_STATE" >/dev/null 2>&1 || true
+    printf '{"sessionId":"0d09c0","hypothesisId":"%s","location":"suoha.sh","message":"%s","data":%s,"timestamp":%s}\n' \
+        "$hid" "$msg" "$data" "$(date +%s)000" >> "$SUOHA_DEBUG_LOG" 2>/dev/null || true
+}
+# #endregion
+
+function ensure_suoha_state() {
+    mkdir -p "$SUOHA_STATE" "$SUOHA_DIR" >/dev/null 2>&1 || true
+}
+
+function save_suoha_credentials() {
+    ensure_suoha_state
+    cat > "$SUOHA_CRED" <<EOF
+UUID=${1}
+URLPATH_VLESS=${2}
+URLPATH_TROJAN=${3}
+PORT_ARGO_ENTRY=${4}
+PORT_ARGO_VL=${5}
+PORT_ARGO_TR=${6}
+NODE_TAG=${7}
+EDGE_IP_VERSION=${8:-4}
+EOF
+    cp -f "$SUOHA_CRED" "${SUOHA_DIR}/credentials.env" 2>/dev/null || true
+    chmod 600 "$SUOHA_CRED" "${SUOHA_DIR}/credentials.env" 2>/dev/null || true
+}
+
+function load_suoha_credentials() {
+    # 优先持久目录，其次安装目录；也可从旧 singbox.json 反推
+    unset SUOHA_UUID SUOHA_PATH_VL SUOHA_PATH_TR SUOHA_PORT_ENTRY SUOHA_PORT_VL SUOHA_PORT_TR SUOHA_NODE_TAG SUOHA_EDGE_IP
+    local f=""
+    if [ -f "$SUOHA_CRED" ]; then
+        f="$SUOHA_CRED"
+    elif [ -f "${SUOHA_DIR}/credentials.env" ]; then
+        f="${SUOHA_DIR}/credentials.env"
+    fi
+    if [ -n "$f" ]; then
+        # shellcheck disable=SC1090
+        set -a
+        # shellcheck disable=SC1090
+        . "$f"
+        set +a
+        SUOHA_UUID="${UUID:-}"
+        SUOHA_PATH_VL="${URLPATH_VLESS:-}"
+        SUOHA_PATH_TR="${URLPATH_TROJAN:-}"
+        SUOHA_PORT_ENTRY="${PORT_ARGO_ENTRY:-}"
+        SUOHA_PORT_VL="${PORT_ARGO_VL:-}"
+        SUOHA_PORT_TR="${PORT_ARGO_TR:-}"
+        SUOHA_NODE_TAG="${NODE_TAG:-}"
+        SUOHA_EDGE_IP="${EDGE_IP_VERSION:-4}"
+    fi
+    if [ -z "${SUOHA_UUID:-}" ] && [ -f "${SUOHA_DIR}/singbox.json" ]; then
+        SUOHA_UUID=$(python3 - <<'PY' 2>/dev/null
+import json
+d=json.load(open("/opt/suoha_quick/singbox.json"))
+for ib in d.get("inbounds",[]):
+    for u in ib.get("users") or []:
+        v=u.get("uuid") or u.get("password")
+        if v:
+            print(v); raise SystemExit
+PY
+)
+        SUOHA_PORT_ENTRY=$(tr -d ' \n\r' < "${SUOHA_DIR}/argo_entry_port" 2>/dev/null || true)
+        if [[ "${SUOHA_PORT_ENTRY}" =~ ^[0-9]+$ ]]; then
+            SUOHA_PORT_VL=$((SUOHA_PORT_ENTRY+1))
+            SUOHA_PORT_TR=$((SUOHA_PORT_ENTRY+2))
+        fi
+        if [ -n "$SUOHA_UUID" ]; then
+            local sid
+            sid=$(echo "$SUOHA_UUID" | awk -F- '{print $1}')
+            SUOHA_PATH_VL="vl-${sid}"
+            SUOHA_PATH_TR="tr-${sid}"
+        fi
+        SUOHA_EDGE_IP=$(tr -d ' \n\r' < "${SUOHA_DIR}/edge_ip_version" 2>/dev/null || echo 4)
+    fi
+    if [ -n "${SUOHA_UUID:-}" ] && [[ "${SUOHA_PORT_ENTRY:-}" =~ ^[0-9]+$ ]]; then
+        return 0
+    fi
+    return 1
+}
 
 function show_progress() {
     local pct=$1
@@ -280,7 +379,108 @@ function stop_all_services() {
     fi
 }
 
+function write_regen_nodes_script() {
+    cat > /opt/suoha_quick/regen_nodes.sh <<'EOS'
+#!/bin/bash
+# 用 credentials.env + 新 Argo 域名重写 nodes/clash（UUID/路径不变）
+set -e
+DIR=/opt/suoha_quick
+DOMAIN="${1:-}"
+CRED=/var/lib/suoha/credentials.env
+[ -f "$DIR/credentials.env" ] && CRED="$DIR/credentials.env"
+[ -f "$CRED" ] || exit 1
+[ -n "$DOMAIN" ] || DOMAIN=$(tr -d ' \n\r' < "$DIR/argo_domain.txt" 2>/dev/null || true)
+[ -n "$DOMAIN" ] || exit 1
+# shellcheck disable=SC1090
+set -a
+# shellcheck disable=SC1090
+. "$CRED"
+set +a
+: "${UUID:?}" "${URLPATH_VLESS:?}" "${URLPATH_TROJAN:?}"
+NODE_TAG="${NODE_TAG:-TW}"
+opt_domains=("$DOMAIN" "cf.090227.xyz" "cloudflare.182682.xyz")
+opt_labels=("默认" "优选1" "优选2")
+> "$DIR/nodes.txt"
+cat > "$DIR/clash.yaml" <<YAML
+port: 7890
+socks-port: 7891
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: true
+proxies:
+YAML
+proxy_names=()
+for idx in "${!opt_domains[@]}"; do
+  d="${opt_domains[$idx]}"; l="${opt_labels[$idx]}"
+  pname="${NODE_TAG}-VLESS-${l}"
+  proxy_names+=("$pname")
+  echo "vless://${UUID}@${d}:443?encryption=none&security=tls&sni=${DOMAIN}&type=ws&host=${DOMAIN}&path=%2F${URLPATH_VLESS}#${pname}" >> "$DIR/nodes.txt"
+  cat >> "$DIR/clash.yaml" <<YAML
+  - name: "${pname}"
+    type: vless
+    server: ${d}
+    port: 443
+    uuid: ${UUID}
+    cipher: auto
+    tls: true
+    udp: true
+    servername: ${DOMAIN}
+    network: ws
+    ws-opts:
+      path: /${URLPATH_VLESS}
+      headers:
+        Host: ${DOMAIN}
+YAML
+done
+for idx in "${!opt_domains[@]}"; do
+  d="${opt_domains[$idx]}"; l="${opt_labels[$idx]}"
+  pname="${NODE_TAG}-Trojan-${l}"
+  proxy_names+=("$pname")
+  echo "trojan://${UUID}@${d}:443?security=tls&sni=${DOMAIN}&type=ws&host=${DOMAIN}&path=%2F${URLPATH_TROJAN}#${pname}" >> "$DIR/nodes.txt"
+  cat >> "$DIR/clash.yaml" <<YAML
+  - name: "${pname}"
+    type: trojan
+    server: ${d}
+    port: 443
+    password: ${UUID}
+    udp: true
+    sni: ${DOMAIN}
+    network: ws
+    ws-opts:
+      path: /${URLPATH_TROJAN}
+      headers:
+        Host: ${DOMAIN}
+YAML
+done
+{
+  echo "proxy-groups:"
+  echo "  - name: PROXY"
+  echo "    type: select"
+  echo "    proxies:"
+  for n in "${proxy_names[@]}"; do echo "      - \"${n}\""; done
+  echo "rules:"
+  echo "  - MATCH,PROXY"
+} >> "$DIR/clash.yaml"
+if command -v base64 >/dev/null 2>&1; then
+  if base64 -w 0 /dev/null >/dev/null 2>&1; then
+    base64 -w 0 "$DIR/nodes.txt" > "$DIR/sub.txt"
+  else
+    base64 "$DIR/nodes.txt" | tr -d '\n' > "$DIR/sub.txt"
+  fi
+fi
+echo "$DOMAIN" > "$DIR/argo_domain.txt"
+mkdir -p /var/www/suoha_sub
+for f in nodes.txt sub.txt clash.yaml; do
+  [ -f "$DIR/$f" ] && cp -f "$DIR/$f" "/var/www/suoha_sub/$f" 2>/dev/null || true
+done
+exit 0
+EOS
+    chmod +x /opt/suoha_quick/regen_nodes.sh
+}
+
 function write_boot_scripts() {
+    write_regen_nodes_script
     cat > /opt/suoha_quick/boot_stop.sh <<'EOS'
 #!/bin/bash
 export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
@@ -338,6 +538,17 @@ fi
 ENTRY_PORT=$(tr -d ' \n\r' < "$DIR/argo_entry_port" 2>/dev/null || true)
 EDGE_IP=$(tr -d ' \n\r' < "$DIR/edge_ip_version" 2>/dev/null || echo 4)
 OLD_DOMAIN=$(tr -d ' \n\r' < "$DIR/argo_domain.txt" 2>/dev/null || true)
+CRED=/var/lib/suoha/credentials.env
+[ -f "$DIR/credentials.env" ] && CRED="$DIR/credentials.env"
+UUID_FINGERPRINT="none"
+if [ -f "$CRED" ]; then
+  # shellcheck disable=SC1090
+  . "$CRED"
+  UUID_FINGERPRINT="${UUID:-none}"
+fi
+mkdir -p /var/lib/suoha
+printf '{"sessionId":"0d09c0","hypothesisId":"C","location":"boot_start.sh","message":"boot_begin","data":{"uuid":"%s","entry":"%s","old_domain":"%s"},"timestamp":%s}\n' \
+  "$UUID_FINGERPRINT" "$ENTRY_PORT" "$OLD_DOMAIN" "$(date +%s)000" >> /var/lib/suoha/debug-boot.ndjson 2>/dev/null || true
 if [ -x "$DIR/cloudflared-linux" ] && [[ "$ENTRY_PORT" =~ ^[0-9]+$ ]]; then
   rm -f "$DIR/argo_main.log"
   nohup "$DIR/cloudflared-linux" tunnel --url "http://127.0.0.1:${ENTRY_PORT}" --no-autoupdate --edge-ip-version "$EDGE_IP" --protocol http2 >"$DIR/argo_main.log" 2>&1 &
@@ -354,7 +565,10 @@ if [ -x "$DIR/cloudflared-linux" ] && [[ "$ENTRY_PORT" =~ ^[0-9]+$ ]]; then
     sleep 1
   done
   if [ -n "$NEW_DOMAIN" ]; then
-    if [ -n "$OLD_DOMAIN" ] && [ "$OLD_DOMAIN" != "$NEW_DOMAIN" ]; then
+    # 优先：用凭据整表重写订阅（比 sed 更稳）；否则退回域名替换
+    if [ -f "$CRED" ] && [ -x "$DIR/regen_nodes.sh" ]; then
+      bash "$DIR/regen_nodes.sh" "$NEW_DOMAIN" >/dev/null 2>&1 || true
+    elif [ -n "$OLD_DOMAIN" ] && [ "$OLD_DOMAIN" != "$NEW_DOMAIN" ]; then
       for f in nodes.txt clash.yaml v2ray.txt surge.conf; do
         [ -f "$DIR/$f" ] && sed -i "s/${OLD_DOMAIN}/${NEW_DOMAIN}/g" "$DIR/$f" 2>/dev/null || true
       done
@@ -369,11 +583,15 @@ if [ -x "$DIR/cloudflared-linux" ] && [[ "$ENTRY_PORT" =~ ^[0-9]+$ ]]; then
         fi
       fi
     fi
-    # 同步静态订阅目录
     mkdir -p /var/www/suoha_sub
     for f in nodes.txt sub.txt clash.yaml surge.conf; do
       [ -f "$DIR/$f" ] && cp -f "$DIR/$f" "/var/www/suoha_sub/$f" 2>/dev/null || true
     done
+    printf '{"sessionId":"0d09c0","hypothesisId":"C","location":"boot_start.sh","message":"argo_domain_updated","data":{"uuid":"%s","old":"%s","new":"%s"},"timestamp":%s}\n' \
+      "$UUID_FINGERPRINT" "$OLD_DOMAIN" "$NEW_DOMAIN" "$(date +%s)000" >> /var/lib/suoha/debug-boot.ndjson 2>/dev/null || true
+  else
+    printf '{"sessionId":"0d09c0","hypothesisId":"B","location":"boot_start.sh","message":"argo_domain_missing","data":{"uuid":"%s"},"timestamp":%s}\n' \
+      "$UUID_FINGERPRINT" "$(date +%s)000" >> /var/lib/suoha/debug-boot.ndjson 2>/dev/null || true
   fi
 fi
 
@@ -452,7 +670,7 @@ function uninstall_all() {
     fi
     sleep 0.5
     show_progress 90 "正在删除配置文件、内核调优与证书目录..."
-    rm -rf /opt/suoha /opt/suoha_quick /etc/suoha_sub_port /var/www/suoha_sub /usr/bin/suoha /etc/sysctl.d/99-suoha-4k.conf
+    rm -rf /opt/suoha /opt/suoha_quick /etc/suoha_sub_port /var/www/suoha_sub /usr/bin/suoha /etc/sysctl.d/99-suoha-4k.conf /var/lib/suoha
     sysctl --system >/dev/null 2>&1
     show_progress 100 "卸载清理完成！"
     echo -e "\n所有梭哈全协议服务、内核网络调优及订阅文件已彻底清理完成。"
@@ -464,17 +682,22 @@ function show_main_menu() {
     echo -e "${CYAN}========================================${NC}"
     echo -e "${GREEN}   梭哈全协议一键脚本 主菜单${NC}"
     echo -e "${CYAN}========================================${NC}"
-    echo -e "  ${GREEN}1)${NC} 安装 / 重新梭哈（会换新 UUID）"
+    echo -e "  ${GREEN}1)${NC} 安装 / 重新梭哈（默认保留旧 UUID；加 --force 才换新）"
     echo -e "  ${GREEN}2)${NC} 恢复服务 / 启用开机自启（不换 UUID）"
     echo -e "  ${YELLOW}3)${NC} 卸载（停止进程并清理文件）"
     echo -e "  ${CYAN}4)${NC} 查看当前节点信息"
     echo -e "  ${RED}0)${NC} 退出"
     echo -e "${CYAN}========================================${NC}"
-    echo -e "${YELLOW}提示: 安装后会注册 systemd 开机自启；重启后 UUID 不变${NC}"
-    echo -e "${YELLOW}命令行: bash suoha.sh install | start | uninstall${NC}"
+    echo -e "${YELLOW}提示: 重启后自动恢复；勿在重启后误选「安装」除非要换号${NC}"
+    echo -e "${YELLOW}命令行: bash suoha.sh install|start|uninstall  [--keep|--force]${NC}"
     echo
-    read -rp "请选择 [0-4]，默认 1: " choice
-    choice="${choice:-1}"
+    local def=1
+    if [ -f /opt/suoha_quick/singbox.json ] || [ -f /var/lib/suoha/credentials.env ]; then
+        def=2
+        echo -e "${GREEN}检测到已有配置 → 默认选项 2（恢复，不换 UUID）${NC}"
+    fi
+    read -rp "请选择 [0-4]，默认 ${def}: " choice
+    choice="${choice:-$def}"
     case "$choice" in
         1|install|i|I)
             quicktunnel_all_in_one
@@ -521,8 +744,41 @@ function quicktunnel_all_in_one() {
     optimize_network_4k
     install_deps
 
+    # 重装前先取出旧凭据（落盘到 /var/lib/suoha，避免 rm 掉 /opt 后丢 UUID）
+    ensure_suoha_state
+    local reuse=0
+    if [ "$FORCE_NEW_UUID" != "1" ] && load_suoha_credentials; then
+        reuse=1
+        if [ "$KEEP_UUID" != "1" ] && [ -t 0 ]; then
+            echo -e "\n${YELLOW}检测到已有 UUID=${SUOHA_UUID}${NC}"
+            echo -e "${YELLOW}本机 Argo 端口=${SUOHA_PORT_ENTRY}（仅 127.0.0.1，不对公网）${NC}"
+            read -rp "是否保留旧 UUID/端口？[Y/n]（直接回车=保留）: " _keep_ans
+            _keep_ans="${_keep_ans:-Y}"
+            case "$_keep_ans" in
+                n|N|no|NO) reuse=0; FORCE_NEW_UUID=1 ;;
+                *) reuse=1 ;;
+            esac
+        fi
+    fi
+    local had_cred=false
+    [ -f "$SUOHA_CRED" ] && had_cred=true
+    # #region agent log
+    suoha_debug_log "A" "install_begin" "{\"reuse\":${reuse},\"force\":${FORCE_NEW_UUID:-0},\"had_cred\":${had_cred}}"
+    # #endregion
+    if [ "$reuse" = "1" ]; then
+        cp -f "$SUOHA_CRED" /tmp/suoha_credentials.env.bak 2>/dev/null || \
+            { load_suoha_credentials && save_suoha_credentials "$SUOHA_UUID" "$SUOHA_PATH_VL" "$SUOHA_PATH_TR" "$SUOHA_PORT_ENTRY" "$SUOHA_PORT_VL" "$SUOHA_PORT_TR" "${SUOHA_NODE_TAG:-TW}" "${SUOHA_EDGE_IP:-4}" && cp -f "$SUOHA_CRED" /tmp/suoha_credentials.env.bak; } || true
+        echo -e "${GREEN}将复用旧 UUID/端口（不会因为重装而换号）${NC}"
+    else
+        echo -e "${YELLOW}将生成新的 UUID/端口（客户端需重新导入/更新订阅）${NC}"
+    fi
+
     rm -rf /opt/suoha /opt/suoha_quick /var/www/suoha_sub
     mkdir -p /opt/suoha_quick/cert >/dev/null 2>&1
+    if [ -f /tmp/suoha_credentials.env.bak ]; then
+        cp -f /tmp/suoha_credentials.env.bak "$SUOHA_CRED"
+        cp -f /tmp/suoha_credentials.env.bak /opt/suoha_quick/credentials.env
+    fi
     cd /opt/suoha_quick || exit 1
 
     # 1. 架构识别与核心下载
@@ -591,17 +847,32 @@ function quicktunnel_all_in_one() {
     # 3. 仅部署 Argo「默认 + 优选」节点（不再生成 Reality/HY2/TUIC/AnyTLS/Snell/SS）
     show_progress 52 "仅启用 Argo 默认/优选节点，跳过直连协议..."
 
-    # 4. 分配凭证与本机 Argo 分流端口（不对公网随机开高位端口）
-    local uuid
-    uuid=$(cat /proc/sys/kernel/random/uuid)
-    local short_id
-    short_id=$(echo "$uuid" | awk -F- '{print $1}')
-    local urlpath_vless="vl-${short_id}"
-    local urlpath_trojan="tr-${short_id}"
-
-    local port_argo_entry=$((RANDOM%10000+11000))
-    local port_argo_vl=$((port_argo_entry+1))
-    local port_argo_tr=$((port_argo_entry+2))
+    # 4. 分配凭证与本机 Argo 分流端口（不对公网随机开高位端口；默认可复用旧值）
+    local uuid short_id urlpath_vless urlpath_trojan
+    local port_argo_entry port_argo_vl port_argo_tr
+    if [ "$reuse" = "1" ] && load_suoha_credentials; then
+        uuid="$SUOHA_UUID"
+        urlpath_vless="$SUOHA_PATH_VL"
+        urlpath_trojan="$SUOHA_PATH_TR"
+        port_argo_entry="$SUOHA_PORT_ENTRY"
+        port_argo_vl="$SUOHA_PORT_VL"
+        port_argo_tr="$SUOHA_PORT_TR"
+        short_id=$(echo "$uuid" | awk -F- '{print $1}')
+        # #region agent log
+        suoha_debug_log "A" "reuse_credentials" "{\"uuid\":\"${uuid}\",\"entry\":${port_argo_entry}}"
+        # #endregion
+    else
+        uuid=$(cat /proc/sys/kernel/random/uuid)
+        short_id=$(echo "$uuid" | awk -F- '{print $1}')
+        urlpath_vless="vl-${short_id}"
+        urlpath_trojan="tr-${short_id}"
+        port_argo_entry=$((RANDOM%10000+11000))
+        port_argo_vl=$((port_argo_entry+1))
+        port_argo_tr=$((port_argo_entry+2))
+        # #region agent log
+        suoha_debug_log "A" "new_credentials" "{\"uuid\":\"${uuid}\",\"entry\":${port_argo_entry}}"
+        # #endregion
+    fi
     echo "${port_argo_entry}" > /opt/suoha_quick/argo_entry_port
 
     # 5. 生成 Sing-box 配置（仅本机 VLESS-WS + Trojan-WS，供 Argo 反代）
@@ -728,9 +999,15 @@ EOF
     # 节点前缀：按公网 IP 识别国家码（如 TW/JP/HK），不再使用超长 Suoha_Node / 机房串
     local node_tag
     node_tag=$(detect_region_code "$server_ip")
+    if [ "$reuse" = "1" ] && [ -n "${SUOHA_NODE_TAG:-}" ]; then
+        node_tag="$SUOHA_NODE_TAG"
+    fi
     show_progress 72 "节点地区前缀: ${node_tag}（按 IP 自动识别）"
     echo "${ips}" > /opt/suoha_quick/edge_ip_version
     echo "${port_argo_entry}" > /opt/suoha_quick/argo_entry_port
+    save_suoha_credentials "$uuid" "$urlpath_vless" "$urlpath_trojan" \
+        "$port_argo_entry" "$port_argo_vl" "$port_argo_tr" "$node_tag" "$ips"
+    write_regen_nodes_script
 
     show_progress 74 "正在申请 Argo 隧道 (VLESS /${urlpath_vless} + Trojan /${urlpath_trojan})..."
     /opt/suoha_quick/cloudflared-linux tunnel --url "http://127.0.0.1:${port_argo_entry}" --no-autoupdate --edge-ip-version "$ips" --protocol http2 > /opt/suoha_quick/argo_main.log 2>&1 &
@@ -924,13 +1201,19 @@ ${clash_online_url}
 开机自启: 已注册 systemd 服务 suoha.service（重启后自动恢复，UUID 不变）
 手动恢复: 菜单选 2  或  bash $0 start
 快捷卸载: 菜单选 3  或  bash $0 uninstall
+强制换新 UUID: bash $0 install --force
 
-注意: Argo 临时域名重启后可能变化，开机脚本会自动改写订阅。
-客户端若用在线订阅，重启后点「更新订阅」即可。
+注意:
+1) Argo 临时域名(*.trycloudflare.com) 每次重启可能变化 → 开机脚本会改写订阅
+2) UUID / WS 路径 / 本机分流端口 已持久化到 /var/lib/suoha/credentials.env
+3) 客户端请用「在线订阅」；重启后点「更新订阅」即可，不要每次重装脚本
 =====================================================================
 EOF
 
     show_progress 99 "正在注册开机自启..."
+    # #region agent log
+    suoha_debug_log "D" "install_done" "{\"uuid\":\"${uuid}\",\"entry\":${port_argo_entry},\"argo\":\"${argo_domain}\"}"
+    # #endregion
     install_systemd_autostart enable-only
 
     show_progress 100 "全部协议部署完成！"
@@ -938,8 +1221,9 @@ EOF
     clear
     cat /opt/suoha_quick/v2ray.txt
     echo -e "\n所有配置已保存至 /opt/suoha_quick/v2ray.txt，随时执行 cat /opt/suoha_quick/v2ray.txt 查看。"
-    echo -e "\n${GREEN}开机自启已开启。重启后无需重装，UUID 不会变。${NC}"
-    echo -e "${YELLOW}卸载: 重新运行脚本选 3，或 bash $0 uninstall${NC}"
+    echo -e "\n${GREEN}开机自启已开启。凭据已写入 /var/lib/suoha/credentials.env${NC}"
+    echo -e "${GREEN}重启后 UUID/端口不变；仅 Argo 临时域名可能变，请更新订阅。${NC}"
+    echo -e "${YELLOW}卸载: bash $0 uninstall | 强制换号: bash $0 install --force${NC}"
 }
 
 # 入口：支持参数，无参数则进菜单
@@ -958,7 +1242,7 @@ case "${ACTION}" in
         ;;
     *)
         echo -e "${RED}未知参数: ${ACTION}${NC}"
-        echo "用法: bash $0 [install|start|uninstall|menu]"
+        echo "用法: bash $0 [install|start|uninstall|menu] [--keep|--force]"
         exit 1
         ;;
 esac

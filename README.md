@@ -5,7 +5,8 @@
 - 节点：`TW-VLESS-默认/优选1/优选2` + `TW-Trojan-默认/优选1/优选2`
 - **已移除**：Reality / AnyTLS / HY2 / TUIC / Snell / SS 直连节点
 - **按公网 IP 自动识别地区前缀**（TW/JP/HK…）
-- **systemd 开机自启**（重启后 UUID 不变）
+- **systemd 开机自启**（重启后 UUID/端口不变；凭据持久化到 `/var/lib/suoha`）
+- **重装默认保留旧 UUID**（只有 `install --force` 才换新号）
 
 上游参考：[a6216abcd/newsuoha.sh](https://github.com/a6216abcd/newsuoha.sh)
 
@@ -24,8 +25,9 @@ bash -c "$(wget -qO- https://raw.githubusercontent.com/lindanbo1688-ctrl/newsuoh
 ```
 
 ```bash
-bash suoha.sh              # 菜单
-bash suoha.sh install      # 安装（换新 UUID，开启开机自启）
+bash suoha.sh              # 菜单（已安装时默认「恢复」）
+bash suoha.sh install      # 安装/重装（默认保留旧 UUID）
+bash suoha.sh install --force  # 强制换新 UUID/端口
 bash suoha.sh start        # 仅恢复（不换 UUID）
 bash suoha.sh uninstall    # 卸载
 ```
@@ -35,7 +37,7 @@ bash suoha.sh uninstall    # 卸载
 ## 交互菜单
 
 ```text
-1) 安装 / 重新梭哈（会换新 UUID，并启用开机自启）
+1) 安装 / 重新梭哈（默认保留旧 UUID；--force 才换新）
 2) 恢复服务 / 启用开机自启（不换 UUID）
 3) 卸载
 4) 查看当前节点信息
@@ -61,11 +63,18 @@ TW-Trojan-优选2
 
 ## 开机自启
 
-安装后注册 `suoha.service`。重启自动恢复，UUID 不变。  
-Argo 临时域名可能变化，脚本会改写订阅；客户端点「更新订阅」即可。
+安装后注册 `suoha.service`。重启自动恢复。
+
+| 项 | 重启后 |
+|---|---|
+| UUID / WS 路径 / 本机分流端口 | **不变**（`/var/lib/suoha/credentials.env`） |
+| Argo 临时域名 `*.trycloudflare.com` | **可能变**（开机脚本自动改写订阅） |
+
+客户端请用**在线订阅**；重启后点「更新订阅」。不要每次重启后再跑一遍「安装」。
 
 ```bash
 systemctl status suoha --no-pager
+cat /var/lib/suoha/credentials.env   # 查看持久化 UUID/端口
 ```
 
 ---
