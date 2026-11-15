@@ -22,19 +22,6 @@ NC='\033[0m'
 SUOHA_DIR=/opt/suoha_quick
 SUOHA_STATE=/var/lib/suoha
 SUOHA_CRED="${SUOHA_STATE}/credentials.env"
-SUOHA_DEBUG_LOG="${SUOHA_STATE}/debug-boot.ndjson"
-
-# #region agent log
-function suoha_debug_log() {
-    # hypothesisId: A=reinstall_wipes B=systemd_missing C=argo_domain_only D=boot_rewrites_uuid
-    local hid="${1:-X}"
-    local msg="${2:-}"
-    local data="${3:-{}}"
-    mkdir -p "$SUOHA_STATE" >/dev/null 2>&1 || true
-    printf '{"sessionId":"0d09c0","hypothesisId":"%s","location":"suoha.sh","message":"%s","data":%s,"timestamp":%s}\n' \
-        "$hid" "$msg" "$data" "$(date +%s)000" >> "$SUOHA_DEBUG_LOG" 2>/dev/null || true
-}
-# #endregion
 
 function ensure_suoha_state() {
     mkdir -p "$SUOHA_STATE" "$SUOHA_DIR" >/dev/null 2>&1 || true
@@ -540,15 +527,7 @@ EDGE_IP=$(tr -d ' \n\r' < "$DIR/edge_ip_version" 2>/dev/null || echo 4)
 OLD_DOMAIN=$(tr -d ' \n\r' < "$DIR/argo_domain.txt" 2>/dev/null || true)
 CRED=/var/lib/suoha/credentials.env
 [ -f "$DIR/credentials.env" ] && CRED="$DIR/credentials.env"
-UUID_FINGERPRINT="none"
-if [ -f "$CRED" ]; then
-  # shellcheck disable=SC1090
-  . "$CRED"
-  UUID_FINGERPRINT="${UUID:-none}"
-fi
 mkdir -p /var/lib/suoha
-printf '{"sessionId":"0d09c0","hypothesisId":"C","location":"boot_start.sh","message":"boot_begin","data":{"uuid":"%s","entry":"%s","old_domain":"%s"},"timestamp":%s}\n' \
-  "$UUID_FINGERPRINT" "$ENTRY_PORT" "$OLD_DOMAIN" "$(date +%s)000" >> /var/lib/suoha/debug-boot.ndjson 2>/dev/null || true
 if [ -x "$DIR/cloudflared-linux" ] && [[ "$ENTRY_PORT" =~ ^[0-9]+$ ]]; then
   rm -f "$DIR/argo_main.log"
   nohup "$DIR/cloudflared-linux" tunnel --url "http://127.0.0.1:${ENTRY_PORT}" --no-autoupdate --edge-ip-version "$EDGE_IP" --protocol http2 >"$DIR/argo_main.log" 2>&1 &
@@ -587,11 +566,6 @@ if [ -x "$DIR/cloudflared-linux" ] && [[ "$ENTRY_PORT" =~ ^[0-9]+$ ]]; then
     for f in nodes.txt sub.txt clash.yaml surge.conf; do
       [ -f "$DIR/$f" ] && cp -f "$DIR/$f" "/var/www/suoha_sub/$f" 2>/dev/null || true
     done
-    printf '{"sessionId":"0d09c0","hypothesisId":"C","location":"boot_start.sh","message":"argo_domain_updated","data":{"uuid":"%s","old":"%s","new":"%s"},"timestamp":%s}\n' \
-      "$UUID_FINGERPRINT" "$OLD_DOMAIN" "$NEW_DOMAIN" "$(date +%s)000" >> /var/lib/suoha/debug-boot.ndjson 2>/dev/null || true
-  else
-    printf '{"sessionId":"0d09c0","hypothesisId":"B","location":"boot_start.sh","message":"argo_domain_missing","data":{"uuid":"%s"},"timestamp":%s}\n' \
-      "$UUID_FINGERPRINT" "$(date +%s)000" >> /var/lib/suoha/debug-boot.ndjson 2>/dev/null || true
   fi
 fi
 
@@ -760,11 +734,6 @@ function quicktunnel_all_in_one() {
             esac
         fi
     fi
-    local had_cred=false
-    [ -f "$SUOHA_CRED" ] && had_cred=true
-    # #region agent log
-    suoha_debug_log "A" "install_begin" "{\"reuse\":${reuse},\"force\":${FORCE_NEW_UUID:-0},\"had_cred\":${had_cred}}"
-    # #endregion
     if [ "$reuse" = "1" ]; then
         cp -f "$SUOHA_CRED" /tmp/suoha_credentials.env.bak 2>/dev/null || \
             { load_suoha_credentials && save_suoha_credentials "$SUOHA_UUID" "$SUOHA_PATH_VL" "$SUOHA_PATH_TR" "$SUOHA_PORT_ENTRY" "$SUOHA_PORT_VL" "$SUOHA_PORT_TR" "${SUOHA_NODE_TAG:-TW}" "${SUOHA_EDGE_IP:-4}" && cp -f "$SUOHA_CRED" /tmp/suoha_credentials.env.bak; } || true
@@ -858,9 +827,6 @@ function quicktunnel_all_in_one() {
         port_argo_vl="$SUOHA_PORT_VL"
         port_argo_tr="$SUOHA_PORT_TR"
         short_id=$(echo "$uuid" | awk -F- '{print $1}')
-        # #region agent log
-        suoha_debug_log "A" "reuse_credentials" "{\"uuid\":\"${uuid}\",\"entry\":${port_argo_entry}}"
-        # #endregion
     else
         uuid=$(cat /proc/sys/kernel/random/uuid)
         short_id=$(echo "$uuid" | awk -F- '{print $1}')
@@ -869,9 +835,6 @@ function quicktunnel_all_in_one() {
         port_argo_entry=$((RANDOM%10000+11000))
         port_argo_vl=$((port_argo_entry+1))
         port_argo_tr=$((port_argo_entry+2))
-        # #region agent log
-        suoha_debug_log "A" "new_credentials" "{\"uuid\":\"${uuid}\",\"entry\":${port_argo_entry}}"
-        # #endregion
     fi
     echo "${port_argo_entry}" > /opt/suoha_quick/argo_entry_port
 
@@ -1211,9 +1174,6 @@ ${clash_online_url}
 EOF
 
     show_progress 99 "正在注册开机自启..."
-    # #region agent log
-    suoha_debug_log "D" "install_done" "{\"uuid\":\"${uuid}\",\"entry\":${port_argo_entry},\"argo\":\"${argo_domain}\"}"
-    # #endregion
     install_systemd_autostart enable-only
 
     show_progress 100 "全部协议部署完成！"

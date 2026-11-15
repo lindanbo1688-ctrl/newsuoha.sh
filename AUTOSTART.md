@@ -30,4 +30,3 @@ systemctl restart suoha
 
 - 旧机器：用本版再跑一次 `install`（选保留 UUID）以写入凭据文件 + 自启
 - 重启后节点连不上：先 **更新订阅**（域名变了），不要重装
-- 调试日志：`/var/lib/suoha/debug-boot.ndjson`
