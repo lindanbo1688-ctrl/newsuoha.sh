@@ -446,7 +446,10 @@ done
   echo "    type: select"
   echo "    proxies:"
   for n in "${proxy_names[@]}"; do echo "      - \"${n}\""; done
+  _pub=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo 61.223.110.206)
   echo "rules:"
+  echo "  - DOMAIN,node.douyin.uk,DIRECT"
+  echo "  - IP-CIDR,${_pub}/32,no-resolve,DIRECT"
   echo "  - MATCH,PROXY"
 } >> "$DIR/clash.yaml"
 if command -v base64 >/dev/null 2>&1; then
@@ -1094,6 +1097,8 @@ EOF
 
     cat >> /opt/suoha_quick/clash.yaml <<EOF
 rules:
+  - DOMAIN,node.douyin.uk,DIRECT
+  - IP-CIDR,${server_ip:-61.223.110.206}/32,no-resolve,DIRECT
   - MATCH,PROXY
 EOF
 
