@@ -3,7 +3,7 @@
 
 export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 
-ACTION="${1:-install}"
+ACTION="${1:-}"
 
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
@@ -148,6 +148,38 @@ function get_server_ipv6() {
     echo "$ip6"
 }
 
+# 按公网 IP 识别两位国家码（TW/JP/HK/US...），失败则 UN
+function detect_region_code() {
+    local ip="$1"
+    local code=""
+
+    # 1) Cloudflare trace（快且稳）
+    code=$(curl -s4 --connect-timeout 3 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '/^loc=/{print $2}' | tr -d '\n\r ')
+    code=$(echo "$code" | tr 'a-z' 'A-Z')
+    if [[ "$code" =~ ^[A-Z]{2}$ ]]; then
+        echo "$code"
+        return 0
+    fi
+
+    # 2) 按 IP 查询
+    if [ -n "$ip" ]; then
+        code=$(curl -s4 --connect-timeout 4 "https://ipapi.co/${ip}/country/" 2>/dev/null | tr -d '\n\r ')
+        code=$(echo "$code" | tr 'a-z' 'A-Z')
+        if [[ "$code" =~ ^[A-Z]{2}$ ]]; then
+            echo "$code"
+            return 0
+        fi
+        code=$(curl -s4 --connect-timeout 4 "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '\n\r ')
+        code=$(echo "$code" | tr 'a-z' 'A-Z')
+        if [[ "$code" =~ ^[A-Z]{2}$ ]]; then
+            echo "$code"
+            return 0
+        fi
+    fi
+
+    echo "UN"
+}
+
 function open_firewall_port() {
     local port="$1"
     if command -v ufw >/dev/null 2>&1; then
@@ -248,8 +280,166 @@ function stop_all_services() {
     fi
 }
 
+function write_boot_scripts() {
+    cat > /opt/suoha_quick/boot_stop.sh <<'EOS'
+#!/bin/bash
+export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+safe_kill() {
+  local f="$1"
+  if [ -f "$f" ]; then
+    local p; p=$(tr -d ' \n\r' < "$f")
+    if [[ "$p" =~ ^[0-9]+$ ]]; then kill -9 "$p" >/dev/null 2>&1; fi
+    rm -f "$f"
+  fi
+}
+safe_kill /opt/suoha_quick/singbox.pid
+safe_kill /opt/suoha_quick/cf_main.pid
+safe_kill /opt/suoha_quick/argo_router.pid
+safe_kill /opt/suoha_quick/snell.pid
+safe_kill /opt/suoha_quick/snell_v6.pid
+safe_kill /opt/suoha_quick/sub_http.pid
+killall -9 sing-box cloudflared-linux snell-server 2>/dev/null || true
+exit 0
+EOS
+
+    cat > /opt/suoha_quick/boot_start.sh <<'EOS'
+#!/bin/bash
+# 开机/手动恢复：用已有配置拉起服务，不重新生成 UUID
+set -e
+export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+DIR=/opt/suoha_quick
+cd "$DIR" || exit 1
+
+if [ ! -x "$DIR/sing-box" ] || [ ! -f "$DIR/singbox.json" ]; then
+  echo "suoha: 未找到已安装配置，请先执行安装"
+  exit 1
+fi
+
+bash "$DIR/boot_stop.sh" >/dev/null 2>&1 || true
+sleep 0.5
+
+# 1) sing-box（Reality/HY2/TUIC/SS 等，UUID 不变）
+nohup "$DIR/sing-box" run -c "$DIR/singbox.json" >"$DIR/singbox.log" 2>&1 &
+echo $! > "$DIR/singbox.pid"
+
+# 2) Argo 本地分流
+if [ -f "$DIR/argo_router.py" ]; then
+  nohup python3 "$DIR/argo_router.py" >/dev/null 2>&1 &
+  echo $! > "$DIR/argo_router.pid"
+fi
+
+# 3) Snell
+if [ -x "$DIR/snell-server" ] && [ -f "$DIR/snell.conf" ]; then
+  nohup "$DIR/snell-server" -c "$DIR/snell.conf" >"$DIR/snell.log" 2>&1 &
+  echo $! > "$DIR/snell.pid"
+fi
+
+# 4) Cloudflare Quick Tunnel（临时域名每次可能变化，但 UUID/路径不变）
+ENTRY_PORT=$(tr -d ' \n\r' < "$DIR/argo_entry_port" 2>/dev/null || true)
+EDGE_IP=$(tr -d ' \n\r' < "$DIR/edge_ip_version" 2>/dev/null || echo 4)
+OLD_DOMAIN=$(tr -d ' \n\r' < "$DIR/argo_domain.txt" 2>/dev/null || true)
+if [ -x "$DIR/cloudflared-linux" ] && [[ "$ENTRY_PORT" =~ ^[0-9]+$ ]]; then
+  rm -f "$DIR/argo_main.log"
+  nohup "$DIR/cloudflared-linux" tunnel --url "http://127.0.0.1:${ENTRY_PORT}" --no-autoupdate --edge-ip-version "$EDGE_IP" --protocol http2 >"$DIR/argo_main.log" 2>&1 &
+  echo $! > "$DIR/cf_main.pid"
+  NEW_DOMAIN=""
+  for i in $(seq 1 40); do
+    NEW_DOMAIN=$(grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" "$DIR/argo_main.log" 2>/dev/null | head -n1 | awk -F// '{print $2}')
+    [ -n "$NEW_DOMAIN" ] && break
+    if [ "$i" -eq 25 ]; then
+      kill -9 "$(tr -d ' \n\r' < "$DIR/cf_main.pid" 2>/dev/null)" 2>/dev/null || true
+      nohup "$DIR/cloudflared-linux" tunnel --url "http://127.0.0.1:${ENTRY_PORT}" --no-autoupdate --edge-ip-version "$EDGE_IP" --protocol quic >"$DIR/argo_main.log" 2>&1 &
+      echo $! > "$DIR/cf_main.pid"
+    fi
+    sleep 1
+  done
+  if [ -n "$NEW_DOMAIN" ]; then
+    if [ -n "$OLD_DOMAIN" ] && [ "$OLD_DOMAIN" != "$NEW_DOMAIN" ]; then
+      for f in nodes.txt clash.yaml v2ray.txt surge.conf; do
+        [ -f "$DIR/$f" ] && sed -i "s/${OLD_DOMAIN}/${NEW_DOMAIN}/g" "$DIR/$f" 2>/dev/null || true
+      done
+    fi
+    echo "$NEW_DOMAIN" > "$DIR/argo_domain.txt"
+    if [ -f "$DIR/nodes.txt" ]; then
+      if command -v base64 >/dev/null 2>&1; then
+        if base64 -w 0 /dev/null >/dev/null 2>&1; then
+          base64 -w 0 "$DIR/nodes.txt" > "$DIR/sub.txt"
+        else
+          base64 "$DIR/nodes.txt" | tr -d '\n' > "$DIR/sub.txt"
+        fi
+      fi
+    fi
+    # 同步静态订阅目录
+    mkdir -p /var/www/suoha_sub
+    for f in nodes.txt sub.txt clash.yaml surge.conf; do
+      [ -f "$DIR/$f" ] && cp -f "$DIR/$f" "/var/www/suoha_sub/$f" 2>/dev/null || true
+    done
+  fi
+fi
+
+# 5) 订阅 HTTP 服务
+SUB_PORT=$(tr -d ' \n\r' < /etc/suoha_sub_port 2>/dev/null || true)
+if [[ "$SUB_PORT" =~ ^[0-9]+$ ]] && [ -d /var/www/suoha_sub ]; then
+  if command -v fuser >/dev/null 2>&1; then fuser -k "${SUB_PORT}/tcp" >/dev/null 2>&1 || true; fi
+  nohup python3 -m http.server "$SUB_PORT" --bind :: --directory /var/www/suoha_sub >/dev/null 2>&1 &
+  echo $! > "$DIR/sub_http.pid"
+fi
+
+echo "suoha: 服务已恢复（UUID 不变；若 Argo 域名变更已自动改写订阅）"
+exit 0
+EOS
+
+    chmod +x /opt/suoha_quick/boot_start.sh /opt/suoha_quick/boot_stop.sh
+}
+
+function install_systemd_autostart() {
+    # $1 = enable-only | restart
+    local mode="${1:-enable-only}"
+    write_boot_scripts
+    cat > /etc/systemd/system/suoha.service <<'EOF'
+[Unit]
+Description=Suoha Quick Proxy Stack (sing-box + Argo + Snell)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/suoha_quick/boot_start.sh
+ExecStop=/opt/suoha_quick/boot_stop.sh
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable suoha.service >/dev/null 2>&1 || true
+    if [ "$mode" = "restart" ]; then
+        systemctl restart suoha.service >/dev/null 2>&1 || systemctl start suoha.service >/dev/null 2>&1 || true
+    fi
+    echo -e "${GREEN}已启用开机自启: systemctl status suoha --no-pager${NC}"
+}
+
+function restore_services_only() {
+    if [ ! -f /opt/suoha_quick/singbox.json ]; then
+        echo -e "${RED}尚未安装，请先选 1 安装。${NC}"
+        return 1
+    fi
+    install_systemd_autostart restart
+    echo -e "${GREEN}已按原配置恢复服务（不重装、不换 UUID）${NC}"
+    echo -e "${YELLOW}说明: Argo 临时域名重启后可能变化，脚本会自动改写订阅；直连节点 UUID 不变。${NC}"
+    echo "查看: systemctl status suoha --no-pager"
+    [ -f /opt/suoha_quick/argo_domain.txt ] && echo "当前 Argo: $(cat /opt/suoha_quick/argo_domain.txt)"
+}
+
 function uninstall_all() {
     show_progress 20 "正在停止运行中的全协议代理进程..."
+    systemctl disable --now suoha.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/suoha.service
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ -x /opt/suoha_quick/boot_stop.sh ]; then
+        bash /opt/suoha_quick/boot_stop.sh >/dev/null 2>&1 || true
+    fi
     stop_all_services
     sleep 0.5
     show_progress 60 "正在清理 HTTP 订阅守护进程..."
@@ -269,9 +459,56 @@ function uninstall_all() {
     exit 0
 }
 
-if [ "$ACTION" == "uninstall" ]; then
-    uninstall_all
-fi
+function show_main_menu() {
+    clear
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${GREEN}   梭哈全协议一键脚本 主菜单${NC}"
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "  ${GREEN}1)${NC} 安装 / 重新梭哈（会换新 UUID）"
+    echo -e "  ${GREEN}2)${NC} 恢复服务 / 启用开机自启（不换 UUID）"
+    echo -e "  ${YELLOW}3)${NC} 卸载（停止进程并清理文件）"
+    echo -e "  ${CYAN}4)${NC} 查看当前节点信息"
+    echo -e "  ${RED}0)${NC} 退出"
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${YELLOW}提示: 安装后会注册 systemd 开机自启；重启后 UUID 不变${NC}"
+    echo -e "${YELLOW}命令行: bash suoha.sh install | start | uninstall${NC}"
+    echo
+    read -rp "请选择 [0-4]，默认 1: " choice
+    choice="${choice:-1}"
+    case "$choice" in
+        1|install|i|I)
+            quicktunnel_all_in_one
+            ;;
+        2|start|restore|r|R)
+            restore_services_only
+            ;;
+        3|uninstall|u|U)
+            echo
+            read -rp "确认卸载并删除 /opt/suoha_quick 等全部数据？[y/N]: " confirm
+            if [[ "${confirm}" =~ ^[Yy]$ ]]; then
+                uninstall_all
+            else
+                echo "已取消卸载"
+            fi
+            ;;
+        4|info|v|V)
+            if [ -f /opt/suoha_quick/v2ray.txt ]; then
+                clear
+                cat /opt/suoha_quick/v2ray.txt
+            else
+                echo -e "${RED}未找到节点信息，请先安装。${NC}"
+            fi
+            ;;
+        0|q|Q|exit)
+            echo "已退出"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}无效选项${NC}"
+            exit 1
+            ;;
+    esac
+}
 
 function quicktunnel_all_in_one() {
     clear
@@ -392,6 +629,7 @@ function quicktunnel_all_in_one() {
     local port_argo_entry=$((RANDOM%10000+11000))
     local port_argo_vl=$((port_argo_entry+1))
     local port_argo_tr=$((port_argo_entry+2))
+    echo "${port_argo_entry}" > /opt/suoha_quick/argo_entry_port
     local port_reality=$((RANDOM%10000+21000))
     local port_anytls=$((port_reality+1))
     local port_hy2=$((port_reality+2))
@@ -692,13 +930,12 @@ EOF
         ips=6
     fi
 
-    local isp
-    isp=$(curl -${ips} -s --connect-timeout 3 https://speed.cloudflare.com/meta 2>/dev/null | awk -F\" '{print $26"-"$18"-"$30}' | sed -e 's/ /_/g')
+    # 节点前缀：按公网 IP 识别国家码（如 TW/JP/HK），不再使用超长 Suoha_Node / 机房串
     local node_tag
-    node_tag=$(echo "$isp" | sed -e 's/_/%20/g' -e 's/,/%2C/g')
-    if [[ -z "$node_tag" || "$node_tag" == "--" || "$node_tag" == "-" ]]; then
-        node_tag="Suoha_Node"
-    fi
+    node_tag=$(detect_region_code "$server_ip")
+    show_progress 72 "节点地区前缀: ${node_tag}（按 IP 自动识别）"
+    echo "${ips}" > /opt/suoha_quick/edge_ip_version
+    echo "${port_argo_entry}" > /opt/suoha_quick/argo_entry_port
 
     show_progress 74 "正在申请 Argo 隧道 (VLESS /${urlpath_vless} + Trojan /${urlpath_trojan})..."
     /opt/suoha_quick/cloudflared-linux tunnel --url "http://127.0.0.1:${port_argo_entry}" --no-autoupdate --edge-ip-version "$ips" --protocol http2 > /opt/suoha_quick/argo_main.log 2>&1 &
@@ -712,6 +949,7 @@ EOF
 
         if [ -n "$argo_domain" ]; then
             rm -f /opt/suoha_quick/argo_main.log
+            echo "${argo_domain}" > /opt/suoha_quick/argo_domain.txt
             show_progress 92 "Argo 单域名双路径隧道分配成功: ${argo_domain}"
             break
         fi
@@ -752,16 +990,16 @@ EOF
 
     local proxy_names=()
     local opt_domains=("cf.090227.xyz" "cloudflare.182682.xyz")
-    local opt_labels=("优选cf.090227" "优选182682")
+    local opt_labels=("优选1" "优选2")
 
     local argo_domains=("$argo_domain" "${opt_domains[@]}")
-    local argo_labels=("默认Argo" "${opt_labels[@]}")
+    local argo_labels=("默认" "${opt_labels[@]}")
 
-    # (A) VLESS Argo 节点组
+    # (A) VLESS Argo 节点组 → TW-VLESS-默认 / TW-VLESS-优选1 / TW-VLESS-优选2
     for idx in "${!argo_domains[@]}"; do
         local d="${argo_domains[$idx]}"
         local l="${argo_labels[$idx]}"
-        local pname="${node_tag}-VLESS-${l}-443"
+        local pname="${node_tag}-VLESS-${l}"
         echo "vless://${uuid}@${d}:443?encryption=none&security=tls&sni=${argo_domain}&type=ws&host=${argo_domain}&path=%2F${urlpath_vless}#${pname}" >> /opt/suoha_quick/nodes.txt
         proxy_names+=("$pname")
         cat >> /opt/suoha_quick/clash.yaml <<EOF
@@ -782,11 +1020,11 @@ EOF
 EOF
     done
 
-    # (B) Trojan Argo 节点组
+    # (B) Trojan Argo 节点组 → TW-Trojan-默认 / TW-Trojan-优选1 / TW-Trojan-优选2
     for idx in "${!argo_domains[@]}"; do
         local d="${argo_domains[$idx]}"
         local l="${argo_labels[$idx]}"
-        local pname="${node_tag}-Trojan-${l}-443"
+        local pname="${node_tag}-Trojan-${l}"
         echo "trojan://${uuid}@${d}:443?security=tls&sni=${argo_domain}&type=ws&host=${argo_domain}&path=%2F${urlpath_trojan}#${pname}" >> /opt/suoha_quick/nodes.txt
         proxy_names+=("$pname")
         cat >> /opt/suoha_quick/clash.yaml <<EOF
@@ -818,7 +1056,7 @@ EOF
 
     if [ -n "$direct_host" ]; then
         # (C1) VLESS Reality Vision 直连节点 (主力首选 - 严格保持 4 空格缩进)
-        local pname_rel="${node_tag}-VLESS-Reality-Vision"
+        local pname_rel="${node_tag}-Reality"
         echo "vless://${uuid}@${direct_host}:${port_reality}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.bing.com&fp=chrome&pbk=${reality_pub}&sid=${reality_sid}&type=tcp&headerType=none#${pname_rel}" >> /opt/suoha_quick/nodes.txt
         proxy_names+=("$pname_rel")
         cat >> /opt/suoha_quick/clash.yaml <<EOF
@@ -839,7 +1077,7 @@ EOF
 EOF
 
         # (C2) VLESS Reality gRPC 直连节点 (严格保持 4 空格缩进)
-        local pname_rel_grpc="${node_tag}-VLESS-Reality-gRPC"
+        local pname_rel_grpc="${node_tag}-Reality-gRPC"
         echo "vless://${uuid}@${direct_host}:${port_rel_grpc}?encryption=none&security=reality&sni=www.bing.com&fp=chrome&pbk=${reality_pub}&sid=${reality_sid}&type=grpc&serviceName=${grpc_service}&mode=gun#${pname_rel_grpc}" >> /opt/suoha_quick/nodes.txt
         proxy_names+=("$pname_rel_grpc")
         cat >> /opt/suoha_quick/clash.yaml <<EOF
@@ -861,7 +1099,7 @@ EOF
 EOF
 
         # (D) AnyTLS 直连节点 (自签 www.bing.com)
-        local pname_any="${node_tag}-AnyTLS-Bing"
+        local pname_any="${node_tag}-AnyTLS"
         echo "anytls://${password_all}@${direct_host}:${port_anytls}?sni=www.bing.com&insecure=1#${pname_any}" >> /opt/suoha_quick/nodes.txt
         proxy_names+=("$pname_any")
         cat >> /opt/suoha_quick/clash.yaml <<EOF
@@ -877,7 +1115,7 @@ EOF
 EOF
 
         # (E) Hysteria2 直连节点 (自签 www.bing.com)
-        local pname_hy2="${node_tag}-Hysteria2-Bing"
+        local pname_hy2="${node_tag}-HY2"
         echo "hysteria2://${password_all}@${direct_host}:${port_hy2}?sni=www.bing.com&insecure=1#${pname_hy2}" >> /opt/suoha_quick/nodes.txt
         proxy_names+=("$pname_hy2")
         cat >> /opt/suoha_quick/clash.yaml <<EOF
@@ -893,7 +1131,7 @@ EOF
 EOF
 
         # (F) TUIC v5 直连节点 (自签 www.bing.com)
-        local pname_tuic="${node_tag}-TUICv5-Bing"
+        local pname_tuic="${node_tag}-TUIC"
         echo "tuic://${uuid}:${password_all}@${direct_host}:${port_tuic}?congestion_control=bbr&alpn=h3&sni=www.bing.com&udp_relay_mode=native&allow_insecure=1#${pname_tuic}" >> /opt/suoha_quick/nodes.txt
         proxy_names+=("$pname_tuic")
         cat >> /opt/suoha_quick/clash.yaml <<EOF
@@ -924,7 +1162,7 @@ EOF
         else
             ss_base64=$(echo -n "$ss_user_info" | base64 -w 0)
         fi
-        local pname_ss6="${node_tag}-SS-IPv6"
+        local pname_ss6="${node_tag}-SS-v6"
         ss_v6_uri="ss://${ss_base64}@[${server_ipv6}]:${port_ss_v6}#${pname_ss6}"
         echo "$ss_v6_uri" >> /opt/suoha_quick/nodes.txt
         proxy_names+=("$pname_ss6")
@@ -943,7 +1181,7 @@ EOF
     local snell_display_lines=""
     if [ $snell_installed -eq 1 ]; then
         if [ -n "$server_ip" ]; then
-            local pname_snell_v4="${node_tag}-Snell-IPv4"
+            local pname_snell_v4="${node_tag}-Snell"
             proxy_names+=("$pname_snell_v4")
             cat >> /opt/suoha_quick/clash.yaml <<EOF
   - name: "${pname_snell_v4}"
@@ -960,7 +1198,7 @@ EOF
         fi
 
         if [ -n "$server_ipv6" ]; then
-            local pname_snell_v6="${node_tag}-Snell-IPv6"
+            local pname_snell_v6="${node_tag}-Snell-v6"
             proxy_names+=("$pname_snell_v6")
             cat >> /opt/suoha_quick/clash.yaml <<EOF
   - name: "${pname_snell_v6}"
@@ -1067,15 +1305,44 @@ clash://install-config?url=${clash_online_url}
 4. Clash / Mihomo 在线 YAML 直链:
 ${clash_online_url}
 
-快捷卸载命令: bash $(readlink -f "$0" 2>/dev/null || echo "$0") uninstall
+开机自启: 已注册 systemd 服务 suoha.service（重启后自动恢复，UUID 不变）
+手动恢复: 菜单选 2  或  bash $0 start
+快捷卸载: 菜单选 3  或  bash $0 uninstall
+
+注意: Argo 临时域名重启后可能变化，开机脚本会自动改写订阅；直连节点 UUID 不变。
+客户端若用在线订阅，重启后点「更新订阅」即可。
 =====================================================================
 EOF
+
+    show_progress 99 "正在注册开机自启..."
+    install_systemd_autostart enable-only
 
     show_progress 100 "全部协议部署完成！"
     sleep 0.6
     clear
     cat /opt/suoha_quick/v2ray.txt
     echo -e "\n所有配置已保存至 /opt/suoha_quick/v2ray.txt，随时执行 cat /opt/suoha_quick/v2ray.txt 查看。"
+    echo -e "\n${GREEN}开机自启已开启。重启后无需重装，UUID 不会变。${NC}"
+    echo -e "${YELLOW}卸载: 重新运行脚本选 3，或 bash $0 uninstall${NC}"
 }
 
-quicktunnel_all_in_one
+# 入口：支持参数，无参数则进菜单
+case "${ACTION}" in
+    uninstall|remove|--uninstall|-u)
+        uninstall_all
+        ;;
+    install|--install|-i)
+        quicktunnel_all_in_one
+        ;;
+    start|restore|restart|--start)
+        restore_services_only
+        ;;
+    menu|"")
+        show_main_menu
+        ;;
+    *)
+        echo -e "${RED}未知参数: ${ACTION}${NC}"
+        echo "用法: bash $0 [install|start|uninstall|menu]"
+        exit 1
+        ;;
+esac
