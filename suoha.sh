@@ -207,19 +207,36 @@ install_deps() {
     show_progress 12 "系统基础依赖检查完成"
 }
 
+function is_ipv4() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
 function get_server_ip() {
     local ip=""
-    ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
-    if [[ -z "$ip" || "$ip" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
-        ip=$(curl -s4 --connect-timeout 3 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '/ip/{print $2}')
+    # 优先复用本机 cf-ddns 已探测到的公网 IP（不查 CF 域名，只读本地状态文件）
+    if [ -f /var/lib/cf-ddns/last_ip ]; then
+        ip=$(tr -d ' \n\r' < /var/lib/cf-ddns/last_ip 2>/dev/null || true)
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+        ip=""
     fi
-    if [ -z "$ip" ]; then
+    ip=$(curl -s4 --connect-timeout 3 https://api.ipify.org 2>/dev/null | tr -d '\n\r ')
+    if ! is_ipv4 "$ip"; then
+        ip=$(curl -s4 --connect-timeout 3 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/{print $2}')
+    fi
+    if ! is_ipv4 "$ip"; then
         ip=$(curl -s4 --connect-timeout 3 https://ipv4.icanhazip.com 2>/dev/null | tr -d '\n\r ')
     fi
-    if [ -z "$ip" ]; then
+    if ! is_ipv4 "$ip"; then
         ip=$(curl -s4 --connect-timeout 3 https://api.ip.sb/ip 2>/dev/null | tr -d '\n\r ')
     fi
-    echo "$ip"
+    if ! is_ipv4 "$ip"; then
+        ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+        [[ "$ip" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]] && ip=""
+    fi
+    is_ipv4 "$ip" && echo "$ip" || echo ""
 }
 
 function get_server_ipv6() {
@@ -446,10 +463,15 @@ done
   echo "    type: select"
   echo "    proxies:"
   for n in "${proxy_names[@]}"; do echo "      - \"${n}\""; done
-  _pub=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo 61.223.110.206)
+  _pub=""
+  [ -f /var/lib/cf-ddns/last_ip ] && _pub=$(tr -d ' \n\r' < /var/lib/cf-ddns/last_ip 2>/dev/null || true)
+  [[ "$_pub" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || _pub=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '\n\r ' || true)
   echo "rules:"
   echo "  - DOMAIN,node.douyin.uk,DIRECT"
-  echo "  - IP-CIDR,${_pub}/32,no-resolve,DIRECT"
+  if [[ "$_pub" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "  - IP-CIDR,${_pub}/32,DIRECT,no-resolve"
+    echo "$_pub" > /var/lib/suoha/sub_pub_ip
+  fi
   echo "  - MATCH,PROXY"
 } >> "$DIR/clash.yaml"
 if command -v base64 >/dev/null 2>&1; then
@@ -469,8 +491,99 @@ EOS
     chmod +x /opt/suoha_quick/regen_nodes.sh
 }
 
+function write_refresh_sub_ip_script() {
+    # 不依赖 CF 域名：只探测公网 IP，重写订阅入口 URL + clash 直连 CIDR
+    cat > /opt/suoha_quick/refresh_sub_ip.sh <<'EOS'
+#!/bin/bash
+# 定期刷新订阅入口公网 IP（默认由 systemd timer 每 24h 触发）
+set -e
+export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+DIR=/opt/suoha_quick
+STATE=/var/lib/suoha
+IP_FILE="${STATE}/sub_pub_ip"
+LOG="${DIR}/refresh_sub_ip.log"
+FORCE=0
+[ "${1:-}" = "--force" ] && FORCE=1
+
+mkdir -p "$STATE" "$DIR"
+is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+
+get_pub_ip() {
+  local ip=""
+  if [ -f /var/lib/cf-ddns/last_ip ]; then
+    ip=$(tr -d ' \n\r' < /var/lib/cf-ddns/last_ip 2>/dev/null || true)
+    is_ipv4 "$ip" && { echo "$ip"; return 0; }
+  fi
+  for u in https://api.ipify.org https://ipv4.icanhazip.com https://api.ip.sb/ip; do
+    ip=$(curl -4 -fsS --connect-timeout 4 --max-time 8 "$u" 2>/dev/null | tr -d '\n\r ')
+    is_ipv4 "$ip" && { echo "$ip"; return 0; }
+  done
+  ip=$(curl -4 -fsS --connect-timeout 4 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/{print $2}')
+  is_ipv4 "$ip" && echo "$ip" || echo ""
+}
+
+NEW_IP=$(get_pub_ip)
+OLD_IP=$(tr -d ' \n\r' < "$IP_FILE" 2>/dev/null || true)
+PORT=$(tr -d ' \n\r' < /etc/suoha_sub_port 2>/dev/null || true)
+TS=$(date '+%F %T %z')
+
+if ! is_ipv4 "$NEW_IP"; then
+  echo "[$TS] ERROR: unable to detect public IPv4" >> "$LOG"
+  exit 1
+fi
+if [ "$FORCE" != "1" ] && [ "$NEW_IP" = "$OLD_IP" ]; then
+  echo "[$TS] unchanged ip=$NEW_IP" >> "$LOG"
+  exit 0
+fi
+
+# clash.yaml 直连规则跟新 IP
+if [ -f "$DIR/clash.yaml" ]; then
+  if grep -qE 'IP-CIDR,[0-9.]+/32' "$DIR/clash.yaml" 2>/dev/null; then
+    sed -i -E "s|IP-CIDR,[0-9.]+/32|IP-CIDR,${NEW_IP}/32|g" "$DIR/clash.yaml"
+  else
+    # 插入到 MATCH 前
+    if grep -q 'MATCH,' "$DIR/clash.yaml" 2>/dev/null; then
+      sed -i "/MATCH,/i\\  - IP-CIDR,${NEW_IP}/32,DIRECT,no-resolve" "$DIR/clash.yaml"
+    else
+      printf '\nrules:\n  - IP-CIDR,%s/32,DIRECT,no-resolve\n  - MATCH,PROXY\n' "$NEW_IP" >> "$DIR/clash.yaml"
+    fi
+  fi
+fi
+
+# v2ray.txt / 展示文件里的订阅 URL：旧 IP → 新 IP（端口固定）
+if [[ "$PORT" =~ ^[0-9]+$ ]]; then
+  for f in v2ray.txt sub_urls.txt; do
+    [ -f "$DIR/$f" ] || continue
+    if is_ipv4 "$OLD_IP"; then
+      sed -i "s|http://${OLD_IP}:${PORT}|http://${NEW_IP}:${PORT}|g" "$DIR/$f" 2>/dev/null || true
+    fi
+    sed -i -E "s|http://([0-9]{1,3}\.){3}[0-9]{1,3}:${PORT}|http://${NEW_IP}:${PORT}|g" "$DIR/$f" 2>/dev/null || true
+  done
+  cat > "$DIR/sub_urls.txt" <<URLS
+# 订阅入口（公网 IP，不依赖 CF 域名；换 IP 后本文件由 refresh_sub_ip 更新）
+# 注意：客户端若已保存旧 IP 链接，换 IP 后需改成下面新地址
+sub_port=${PORT}
+public_ip=${NEW_IP}
+updated_at=${TS}
+sub_txt=http://${NEW_IP}:${PORT}/sub.txt
+clash_yaml=http://${NEW_IP}:${PORT}/clash.yaml
+URLS
+fi
+
+echo "$NEW_IP" > "$IP_FILE"
+mkdir -p /var/www/suoha_sub
+for f in nodes.txt sub.txt clash.yaml surge.conf sub_urls.txt; do
+  [ -f "$DIR/$f" ] && cp -f "$DIR/$f" "/var/www/suoha_sub/$f" 2>/dev/null || true
+done
+echo "[$TS] refreshed sub ip: ${OLD_IP:-none} -> ${NEW_IP} port=${PORT:-?}" >> "$LOG"
+exit 0
+EOS
+    chmod +x /opt/suoha_quick/refresh_sub_ip.sh
+}
+
 function write_boot_scripts() {
     write_regen_nodes_script
+    write_refresh_sub_ip_script
     cat > /opt/suoha_quick/boot_stop.sh <<'EOS'
 #!/bin/bash
 export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
@@ -580,11 +693,47 @@ if [[ "$SUB_PORT" =~ ^[0-9]+$ ]] && [ -d /var/www/suoha_sub ]; then
   echo $! > "$DIR/sub_http.pid"
 fi
 
+# 6) 刷新订阅入口公网 IP（不依赖 CF 域名）
+if [ -x "$DIR/refresh_sub_ip.sh" ]; then
+  bash "$DIR/refresh_sub_ip.sh" --force >/dev/null 2>&1 || true
+fi
+
 echo "suoha: 服务已恢复（UUID 不变；若 Argo 域名变更已自动改写订阅）"
 exit 0
 EOS
 
-    chmod +x /opt/suoha_quick/boot_start.sh /opt/suoha_quick/boot_stop.sh
+    chmod +x /opt/suoha_quick/boot_start.sh /opt/suoha_quick/boot_stop.sh /opt/suoha_quick/refresh_sub_ip.sh
+}
+
+function install_sub_ip_timer() {
+    write_refresh_sub_ip_script
+    cat > /etc/systemd/system/suoha-sub-ip.service <<'EOF'
+[Unit]
+Description=Suoha refresh subscription public IP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/suoha_quick/refresh_sub_ip.sh
+Nice=10
+EOF
+    cat > /etc/systemd/system/suoha-sub-ip.timer <<'EOF'
+[Unit]
+Description=Daily refresh Suoha subscription public IP
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=24h
+AccuracySec=1h
+Persistent=true
+Unit=suoha-sub-ip.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now suoha-sub-ip.timer >/dev/null 2>&1 || true
 }
 
 function install_systemd_autostart() {
@@ -607,12 +756,14 @@ TimeoutStartSec=120
 [Install]
 WantedBy=multi-user.target
 EOF
+    install_sub_ip_timer
     systemctl daemon-reload
     systemctl enable suoha.service >/dev/null 2>&1 || true
     if [ "$mode" = "restart" ]; then
         systemctl restart suoha.service >/dev/null 2>&1 || systemctl start suoha.service >/dev/null 2>&1 || true
     fi
     echo -e "${GREEN}已启用开机自启: systemctl status suoha --no-pager${NC}"
+    echo -e "${GREEN}订阅公网 IP 每 24h 自动刷新: systemctl status suoha-sub-ip.timer --no-pager${NC}"
 }
 
 function restore_services_only() {
@@ -630,7 +781,8 @@ function restore_services_only() {
 function uninstall_all() {
     show_progress 20 "正在停止运行中的全协议代理进程..."
     systemctl disable --now suoha.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/suoha.service
+    systemctl disable --now suoha-sub-ip.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/suoha.service /etc/systemd/system/suoha-sub-ip.service /etc/systemd/system/suoha-sub-ip.timer
     systemctl daemon-reload >/dev/null 2>&1 || true
     if [ -x /opt/suoha_quick/boot_stop.sh ]; then
         bash /opt/suoha_quick/boot_stop.sh >/dev/null 2>&1 || true
@@ -663,17 +815,18 @@ function show_main_menu() {
     echo -e "  ${GREEN}2)${NC} 恢复服务 / 启用开机自启（不换 UUID）"
     echo -e "  ${YELLOW}3)${NC} 卸载（停止进程并清理文件）"
     echo -e "  ${CYAN}4)${NC} 查看当前节点信息"
+    echo -e "  ${CYAN}5)${NC} 刷新订阅公网 IP（不依赖 CF 域名）"
     echo -e "  ${RED}0)${NC} 退出"
     echo -e "${CYAN}========================================${NC}"
     echo -e "${YELLOW}提示: 重启后自动恢复；勿在重启后误选「安装」除非要换号${NC}"
-    echo -e "${YELLOW}命令行: bash suoha.sh install|start|uninstall  [--keep|--force]${NC}"
+    echo -e "${YELLOW}命令行: bash suoha.sh install|start|uninstall|refresh-ip  [--keep|--force]${NC}"
     echo
     local def=1
     if [ -f /opt/suoha_quick/singbox.json ] || [ -f /var/lib/suoha/credentials.env ]; then
         def=2
         echo -e "${GREEN}检测到已有配置 → 默认选项 2（恢复，不换 UUID）${NC}"
     fi
-    read -rp "请选择 [0-4]，默认 ${def}: " choice
+    read -rp "请选择 [0-5]，默认 ${def}: " choice
     choice="${choice:-$def}"
     case "$choice" in
         1|install|i|I)
@@ -698,6 +851,9 @@ function show_main_menu() {
             else
                 echo -e "${RED}未找到节点信息，请先安装。${NC}"
             fi
+            ;;
+        5|refresh-ip|refresh_ip)
+            refresh_sub_ip_now
             ;;
         0|q|Q|exit)
             echo "已退出"
@@ -1095,12 +1251,23 @@ EOF
         echo "      - \"${pname}\"" >> /opt/suoha_quick/clash.yaml
     done
 
-    cat >> /opt/suoha_quick/clash.yaml <<EOF
+    # 订阅入口只用公网 IP（不写 CF/Argo 域名）；IP 由 refresh_sub_ip 每 24h 刷新
+    if [ -n "$server_ip" ]; then
+        ensure_suoha_state
+        echo "$server_ip" > "${SUOHA_STATE}/sub_pub_ip"
+        cat >> /opt/suoha_quick/clash.yaml <<EOF
 rules:
   - DOMAIN,node.douyin.uk,DIRECT
-  - IP-CIDR,${server_ip:-61.223.110.206}/32,no-resolve,DIRECT
+  - IP-CIDR,${server_ip}/32,DIRECT,no-resolve
   - MATCH,PROXY
 EOF
+    else
+        cat >> /opt/suoha_quick/clash.yaml <<EOF
+rules:
+  - DOMAIN,node.douyin.uk,DIRECT
+  - MATCH,PROXY
+EOF
+    fi
 
     show_progress 98 "正在编码 Base64 订阅并拉起本地 HTTP 订阅服务..."
     if [ "$OS_NAME" == "Alpine" ]; then
@@ -1115,6 +1282,7 @@ EOF
     elif [ -n "$server_ipv6" ]; then
         sub_host="[${server_ipv6}]"
     else
+        # 无公网 IP 时临时回退 Argo 域名，正常路径不会走到这里
         sub_host="$argo_domain"
     fi
 
@@ -1125,6 +1293,12 @@ EOF
 
     local sub_online_url="http://${sub_host}:${sub_port}/sub.txt"
     local clash_online_url="http://${sub_host}:${sub_port}/clash.yaml"
+    write_refresh_sub_ip_script
+    bash /opt/suoha_quick/refresh_sub_ip.sh --force >/dev/null 2>&1 || true
+    if [ -f /opt/suoha_quick/sub_urls.txt ]; then
+        sub_online_url=$(awk -F= '/^sub_txt=/{print $2}' /opt/suoha_quick/sub_urls.txt)
+        clash_online_url=$(awk -F= '/^clash_yaml=/{print $2}' /opt/suoha_quick/sub_urls.txt)
+    fi
 
     local cc_active
     cc_active=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "default")
@@ -1174,7 +1348,9 @@ ${clash_online_url}
 注意:
 1) Argo 临时域名(*.trycloudflare.com) 每次重启可能变化 → 开机脚本会改写订阅
 2) UUID / WS 路径 / 本机分流端口 已持久化到 /var/lib/suoha/credentials.env
-3) 客户端请用「在线订阅」；重启后点「更新订阅」即可，不要每次重装脚本
+3) 订阅入口用公网 IP（不依赖 CF 域名）；每 24h 自动探测并改写本机展示链接
+4) 客户端若已保存旧 IP 订阅地址，换 IP 后请改用最新链接: cat /opt/suoha_quick/sub_urls.txt
+5) 手动刷新: bash $0 refresh-ip
 =====================================================================
 EOF
 
@@ -1188,7 +1364,16 @@ EOF
     echo -e "\n所有配置已保存至 /opt/suoha_quick/v2ray.txt，随时执行 cat /opt/suoha_quick/v2ray.txt 查看。"
     echo -e "\n${GREEN}开机自启已开启。凭据已写入 /var/lib/suoha/credentials.env${NC}"
     echo -e "${GREEN}重启后 UUID/端口不变；仅 Argo 临时域名可能变，请更新订阅。${NC}"
-    echo -e "${YELLOW}卸载: bash $0 uninstall | 强制换号: bash $0 install --force${NC}"
+    echo -e "${GREEN}订阅公网 IP 每 24h 自动刷新（systemd: suoha-sub-ip.timer）${NC}"
+    echo -e "${YELLOW}卸载: bash $0 uninstall | 强制换号: bash $0 install --force | 刷新IP: bash $0 refresh-ip${NC}"
+}
+
+function refresh_sub_ip_now() {
+    write_refresh_sub_ip_script
+    bash /opt/suoha_quick/refresh_sub_ip.sh --force
+    echo -e "${GREEN}已刷新订阅公网 IP${NC}"
+    [ -f /opt/suoha_quick/sub_urls.txt ] && cat /opt/suoha_quick/sub_urls.txt
+    [ -f /var/lib/suoha/sub_pub_ip ] && echo "saved: $(cat /var/lib/suoha/sub_pub_ip)"
 }
 
 # 入口：支持参数，无参数则进菜单
@@ -1202,12 +1387,15 @@ case "${ACTION}" in
     start|restore|restart|--start)
         restore_services_only
         ;;
+    refresh-ip|refresh_ip|--refresh-ip)
+        refresh_sub_ip_now
+        ;;
     menu|"")
         show_main_menu
         ;;
     *)
         echo -e "${RED}未知参数: ${ACTION}${NC}"
-        echo "用法: bash $0 [install|start|uninstall|menu] [--keep|--force]"
+        echo "用法: bash $0 [install|start|uninstall|refresh-ip|menu] [--keep|--force]"
         exit 1
         ;;
 esac
